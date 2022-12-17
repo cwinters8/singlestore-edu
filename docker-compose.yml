@@ -1,0 +1,10 @@
+services:
+  singlestore:
+    image: singlestore/cluster-in-a-box:latest
+    # env_file: ./.env
+    environment:
+      LICENSE_KEY: ${SINGLESTORE_LICENSE_KEY}
+      ROOT_PASSWORD: ${SINGLESTORE_ROOT_PASSWORD}
+    ports:
+      - "3306:3306"
+      - "3000:8080"

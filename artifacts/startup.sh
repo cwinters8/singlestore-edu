@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [ ! -f /var/lib/memsql/nodes.hcl ]; then
+    echo version = 1 > /var/lib/memsql/nodes.hcl
+fi
+
+if [ ! -f /var/lib/memsql/nodes.hcl.lock ]; then
+    touch /var/lib/memsql/nodes.hcl.lock
+fi
+
+nodes_count=$(memsqlctl -yj list-nodes | jq ".nodes" | jq length)
+
+if [ "$nodes_count" == "2" ]; then
+    echo Starting Cluster
+    memsqlctl start-node --all -yj
+else #initialize the cluster
+    echo Initializing SingleStore Cluster in a Box
+    if [ -z "${LICENSE_KEY-}" ]; then
+        echo !!! ERROR !!!
+        echo The LICENSE_KEY environment variable must be specified when creating the Docker container
+        exit 1
+    fi
+    if [ -z "${ROOT_PASSWORD-}" ]; then
+        echo !!! ERROR !!!
+        echo The ROOT_PASSWORD environment variable must be specified when creating the Docker container
+        exit 1
+    fi
+
+    echo Creating...
+    master_id=$(memsqlctl -jy create-node --no-start | jq ".memsqlId" -r)
+    memsqlctl -y create-node --no-start --port 3307
+    echo Done.
+
+    echo Configuring...
+    memsqlctl -y update-config --all --key minimum_core_count --value 0
+    memsqlctl -y update-config --all --key minimum_memory_mb --value 0
+
+    if [ -n "${HTTP_API-}" ]; then
+        echo Enabling HTTP API on port ${HTTP_API_PORT-9000}
+        memsqlctl -y update-config --memsql-id $master_id --key "http_proxy_port" --value ${HTTP_API_PORT-9000}
+        memsqlctl -y update-config --memsql-id $master_id --key "http_api" --value "on"
+    fi
+    echo Done.
+
+    echo Bootstrapping...
+    memsqlctl -y start-node --all
+    memsqlctl -y set-license --memsql-id $master_id --license $LICENSE_KEY
+    memsqlctl -y bootstrap-aggregator --memsql-id $master_id --host 127.0.0.1
+    memsqlctl -y add-leaf --host 127.0.0.1 --port 3307
+    memsqlctl -y change-root-password --all --password $ROOT_PASSWORD
+    if [ -n "${EXTERNAL_FUNCTIONS-}" ]; then
+        echo Enabling external functions
+        memsqlctl -y update-config --set-global --all --key "enable_external_functions" --value "on"
+    fi
+    echo Done.
+
+    echo Configuring Toolbox...
+    sdb-toolbox-config register-host -y --localhost --host 127.0.0.1
+    echo Done.
+
+    if [ -f /init.sql ]; then
+        echo Running /init.sql...
+        memsql -p$ROOT_PASSWORD < /init.sql
+        echo Done.
+    fi
+
+    if [ -z "${START_AFTER_INIT-}" ]; then
+        echo "
+         Successful initialization!
+
+         To start the cluster:
+            docker start (CONTAINER_NAME)
+
+         To stop the cluster (must be started):
+            docker stop (CONTAINER_NAME)
+
+         To remove the cluster (all data will be deleted):
+            docker rm (CONTAINER_NAME)
+"
+        exit 0
+    fi
+fi
+
+log_files=()
+nodeIds=$(memsqlctl -jy list-nodes | jq ".nodes[].memsqlId" -r)
+for id in ${nodeIds[@]}
+do
+    log_dir=$(memsqlctl -yj describe-node --property tracelogsdir --memsql-id $id | jq -r ".tracelogsdir")
+    log_files+=("$log_dir/memsql.log")
+done
+
+singlestoredb-studio --port 8080 1>/dev/null 2>/dev/null &
+studio_pid=$!
+log_files+=("/var/lib/singlestoredb-studio/studio.log")
+
+args_file="/etc/memsql/memsql_exporter_ma.args"
+if [ ! -f $args_file ]; then
+    install_path=$(dirname $(realpath "/usr/bin/memsql_exporter"))
+    args_file=$install_path"/conf/memsql_exporter_ma.args"
+fi
+explog="/var/lib/memsql/memsql_exporter.log"
+memsql_exporter @$args_file 1>$explog 2>$explog &
+exporter_pid=$!
+log_files+=($explog)
+
+tail -F $(printf '%s ' "${log_files[@]}") &
+tail_pid=$!
+
+cleanup() {
+    echo Stopping Cluster...
+    memsqlctl -y stop-node --all
+    kill -15 $studio_pid
+    kill -15 $exporter_pid
+    kill -15 $tail_pid
+    echo Stopped.
+}
+
+trap cleanup SIGTERM SIGQUIT SIGINT
+wait $tail_pid
